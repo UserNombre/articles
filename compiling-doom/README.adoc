@@ -1,0 +1,256 @@
+:imagesdir: img
+:sectanchors:
+:sectlinks:
+:sectnums:
+:sectnumlevels: 2
+:toc:
+:toclevels: 2
+
+== Introduction
+[.text-justify]
+DOOM was link:https://en.wikipedia.org/wiki/Official_versions_of_Doom#Linux[ported] to Linux by Dave D. Taylor in 1994, and link:https://github.com/id-Software/DOOM[open-sourced] in 1997 by id Software themselves. 20 years is a long time, and when dealing with software this becomes even more evident. It's still very possible to run it; although, as one might expect, things won't simply work out of the box, and will require some tweaking.
+
+[.text-justify]
+Having done it once, doing it again becomes trivial. Still, it is from the journey, and not the destination, that we learn. For this reason, the following will more or less detail the steps that I took leading to the destination, with the intention of leaving a written record both for my future self, and those who might stumble across some of these issues.
+
+== Directory structure
+[.text-justify]
+After obtaining the sources, a listing of the main directory returns the following:
+....
+ipx
+linuxdoom-1.10
+README.TXT
+sersrc
+sndserv
+....
+[.text-justify]
+For our purpose we'll be looking only at `linuxdoom-1.10` and `sndserv`, but here's a quick summary of the contents of all of them:
+
+[horizontal]
+ipx:: sources for networking stuff
+lixudoom-1.10:: sources for the game engine.
+README.TXT:: self-describing
+sersrc:: sources for the server module.
+sndserv:: sources for the sound module.
+
+== linuxdoom-1.10
+=== Compiling it
+==== Makefile
+[.text-justify]
+Surprisingly enough, if we naively run `make`, the first error we get is due to the `Makefile` itself:
+....
+Fatal error: can't create linux/doomdef.o: No such file or directory
+....
+[.text-justify]
+Turns out the `linux` object folder doesn't exist and the `Makefile` doesn't take account of it, most likely `make` did in the past but doesn't anymore.
+
+[.text-justify]
+We can fix this by simply creating the folder ourselves or adding some link:https://stackoverflow.com/questions/1950926/create-directories-using-make-file[lines]:
+....
+all:	dir $(O)/linuxxdoom
+
+.PHONY: dir
+dir: 	$(O)
+
+$(O):
+	mkdir -p $(O)
+....
+
+==== errno
+[.text-justify]
+The next error is related to `glibc`, seemingly a missing header file:
+....
+i_video.c:49:10: fatal error: errnos.h: No such file or directory
+....
+[.text-justify]
+What at first glance might look like a typo for `errno.h`, happens to be a legacy file from https://en.wikipedia.org/wiki/GNU_C_Library#Version_history[old glibc days]. If we grep through the source for link:http://ftp.gnu.org/gnu/glibc/glibc-1.09.1.tar.gz[glibc-1.09.1] (link:https://en.wikipedia.org/wiki/GNU_C_Library#Linux_libc[not actually used by linux]), we do indeed find several files named `errnos.h` containing error definitions.
+
+[.text-justify]
+This could've easily been avoided by including `errno.h` instead, which even at the time already included `errnos.h`.
+
+==== 32-bit
+[.text-justify]
+In the next go we get a bunch of warnings and after that a pattern of errors like this one:
+....
+m_misc.c:257:48: warning: cast from pointer to integer of different size [-Wpointer-to-int-cast]
+  257 |     {"sndserver", (int *) &sndserver_filename, (int) "sndserver"},
+      |                                                ^
+m_misc.c:257:48: error: initializer element is not constant
+m_misc.c:257:48: note: (near initialization for ‘defaults[14].defaultvalue’)
+....
+[.text-justify]
+To understand this error we need to keep in mind that the targetted architecture was x86, which means that pointers were expected to be 32-bit just like integers were. This allowed the `defaultvalue` member of `default_t` to store pointers and all kinds of types fitting in 32-bits (albeit in a rather hacky fashion).
+....
+typedef struct
+{
+    char*	name;
+    int*	location;
+    int		defaultvalue;
+    int		scantranslate;
+    int		untranslated;
+} default_t;
+....
+[.text-justify]
+This, however, doesn't work in 64-bit. Since pointers are also 64-bit this cast now involves an extra operation and therefore cannot be considered a valid initializer element. In the end this is just a reminder that we should've been targetting 32-bit since the start. We'll need to configure our compiler to match the expected bitness, and while we are at it do the same for required libraries to avoid linker errors.
+
+[.text-justify]
+This is the relevant part of the `Makefile` requiring changes:
+....
+CC=  gcc  # gcc or g++
+
+CFLAGS=-g -Wall -DNORMALUNIX -DLINUX # -DUSEASM 
+LDFLAGS=-L/usr/X11R6/lib
+LIBS=-lXext -lX11 -lnsl -lm
+....
+[.text-justify]
+We need to add the `-m32` flag to the `CC` variable and install the 32-bit version of the libraries in `LIBS`. Depending on the system's `PATH` variable one might need to add an `-L` option with the path for 32-bit libraries in `LDFLAGS`. Unless running on a link:https://www.x.org/wiki/X11R6/[really old] system `-L/usr/X11R6/lib` can be safely removed.
+
+==== errno (bis)
+[.text-justify]
+The error is once again related to `glibc`, but this time around we get a linking error:
+....
+/usr/bin/ld: errno: TLS definition in /usr/lib32/libc.so.6 section .tbss mismatches non-TLS reference in linux/i_sound.o
+....
+[.text-justify]
+If we look at the referenced file we'll find that `errno` was declared as `extern int errno` rather than the current `extern __thread int errno attribute_tls_model_ie` link:https://en.wikipedia.org/wiki/Thread-local_storage[per thread] version. Yet another reason to include header files instead of directly dealing with internals.
+
+[.text-justify]
+Removing the line that caused the error and including `errno.h` atop the file fixes it.
+
+==== The End (?)
+[.text-justify]
+It finally compiles! It will run, right? Well yes, but actually no:
+....
+ Game mode indeterminate.
+                     Public DOOM - v1.10                           
+V_Init: allocate screens.
+M_LoadDefaults: Load system defaults.
+Z_Init: Init zone memory allocation daemon. 
+W_Init: Init WADfiles.
+Error: W_InitFiles: no files found
+Segmentation fault (core dumped)
+....
+[.text-justify]
+(that last line doesn't look like it should be there, yikes!)
+
+=== Fixing it
+==== WAD now?
+[.text-justify]
+`Error: W_InitFiles: no files found` speaks for itself, and if we look through the source code it becomes obvious:
+
+[.text-justify]
+Excerpt from `d_main.c`:
+....
+void D_DoomMain (void)
+{
+    (···)
+    IdentifyVersion ();
+    (···)
+    printf ("W_Init: Init WADfiles.\n");
+    W_InitMultipleFiles (wadfiles);
+    (···)
+}
+
+void IdentifyVersion (void)
+{
+    (...)
+    doomuwad = malloc(strlen(doomwaddir)+1+8+1);
+    sprintf(doomuwad, "%s/doomu.wad", doomwaddir);
+    (...)
+    if ( !access (doomuwad,R_OK) )
+    {
+        gamemode = retail;
+        D_AddFile (doomuwad);
+        return;
+    }
+    (...)
+}
+....
+[.text-justify]
+While all the relevant source code is contained in the the same can't be said for the link:https://doom.fandom.com/wiki/WAD[game file]. We could look for some compatible `WAD` file on the link:https://www.wad-archive.com/search?q=id-software[wad-archive] or elsewhere on the Internet, but thankfully folks at id Software already link:https://archive.org/details/The_Ultimate_Doom[provide] us with link:https://doom.fandom.com/wiki/Versions_of_Doom_and_Doom_II#v1.9[the last release] which we can verify to be https://doom.fandom.com/wiki/DOOM.WAD[1.9ud].
+
+[.text-justify]
+After we copy our brand-new `WAD` file to the same folder as the executable, we need to rename it to `doomu.wad`, otherwise it won't recognize it. Moreover, we need to `cd` into the folder or set the `DOOMWADDIR` environment variable for it to find the file.
+
+[.text-justify]
+If we now give it a try we see it progresses further:
+....
+(···)
+W_Init: Init WADfiles.
+ adding ./doomu.wad
+(···)
+I_Init: Setting up machine state.
+Could not start sound server [./sndserver]
+(···)
+Error: xdoom currently only supports 256-color PseudoColor screens
+Segmentation fault (core dumped)
+....
+[.text-justify]
+We see that it properly adds the file now, a complaint about not being able to start `sndserver`, which we shall ignore for now, and finally a display error. Doesn't look that bad, does it?
+
+==== 8-bit hell
+[.text-justify]
+A quick search leads to some link:https://wiki.winehq.org/256_Color_Mode[useful] link:https://unix.stackexchange.com/questions/287695/how-can-i-run-linux-in-256-color[information].
+
+[.text-justify]
+Using link:https://en.wikipedia.org/wiki/Xephyr[Xephyr], we can put together a simple `bash` script to run it:
+....
+#!/bin/bash
+Xephyr :2 -screen 320x200x8 -terminate &
+DISPLAY=:2 ./linuxxdoom
+....
+[.text-justify]
+We tell `Xephyr` to use display `:2` and pass it the `-screen` flag with DOOM's default resolution (`320x200`) and `x8` to enable link:https://utcc.utoronto.ca/~cks/space/blog/unix/X11TruecolorHistory[PseudoColor] mode. The `-terminate` flag makes sure that when the last client exits the `Xserver`, the latter automatically shuts down.
+
+[.text-justify]
+However, after running it, we are met with this hideous-looking, hellish clump of pixels:
+
+image::menu_bad.png[]
+
+[.text-justify]
+As it happens, it didn't take too long before I found somebody link:https://stackoverflow.com/questions/60823500/x-server-8-bit-pseudo-color-initiating-the-palette-linux-xdoom[documenting] the exact same issue, though without answer. Reading the comments on the post, I couldn't help remembering link:https://xkcd.com/979/[this]. Following that, I spent a few hours looking for a solution to no avail, reaching dead end after dead end.
+
+==== 8-bit heaven
+[.text-justify]
+Knowing next to nothing about X programming, I was ready to dive deep into its documentation. However, before doing so I gave my search engine a last go, and chanced upon an link:http://geekchef.com/running-doom-under-linux/[article] of someone doing the same 10 years ago. The article explained much of the stuff I had to look up, and some that I had missed (which I will  address later on). Would've been nice finding it early on. Still, there was no
+
+[.text-justify]
+Buried in the comment section was the last piece of the puzzle, the holy grail. Someone by the name of `Greg` had managed to fix it.
+
+[.text-justify]
+The missing line in `i_video.c`:
+....
+void I_InitGraphics(void)
+{
+    (···)
+    X_cmap = XCreateColormap(X_display, RootWindow(X_display, X_screen), X_visual, AllocAll);
+    XInstallColormap(X_display, X_cmap); // A single line to rule them all
+    (···)
+}
+....
+
+[.text-justify]
+After all that digging around, we finally get what we expected:
+
+image::menu_good.png[]
+
+[.text-justify]
+Even though it runs, the created screen is too small to be playable. Luckily, DOOM has options `-1`, `-2`, `-3` and `-4` (not implemented, sadly), that let us upscale the game's resolution. We can combine that with `Xephyr` 's `-fullscreen` option to get a nice fullscreen window (note that the first two values that we pass `-screen` no longer make sense).
+
+[.text-justify]
+We can use link:https://www.x.org/archive/X11R6.8.1/doc/xinit.1.html[xinit] to make it into a one-liner:
+....
+#!/bin/bash
+xinit ./linuxxdoom -3 -geom +203+84 -- $(which Xephyr) :2 -screen 960x600x8 -fullscreen -terminate -title DOOM
+....
+
+[.text-justify]
+The offsets passed to `linuxxdoom` in the `-geom` option allow us to center the game screen. For some reason the code parsing the parameter in `i_video.c` is wrong, the `6` in `else if (n==6)` should be a `4`, or else it will crash with `bad -geom parameter`.
+
+[.text-justify]
+The previous script also contains a race condition that sometimes crashes DOOM. `xinit` gets rid of it, since it first spawns the server and executes the client only after it is done with the former. This is the final result:
+
+image::menu_big.png[]
+
+== sndserv
+`WIP`
